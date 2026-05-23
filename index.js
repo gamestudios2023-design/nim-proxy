@@ -17,6 +17,10 @@ app.all('/v1/*', async (req, res) => {
   const nimPath = req.path.slice(3); // /v1/chat/completions → /chat/completions
   const url = `${NIM_BASE}${nimPath}`;
 
+  // Override model if x-nim-model header is set
+  const body = { ...req.body };
+  if (req.headers['x-nim-model']) body.model = req.headers['x-nim-model'];
+
   try {
     const nimRes = await fetch(url, {
       method: req.method,
@@ -26,7 +30,7 @@ app.all('/v1/*', async (req, res) => {
         'Accept': req.headers['accept'] || 'application/json',
       },
       body: ['POST', 'PUT', 'PATCH'].includes(req.method)
-        ? JSON.stringify(req.body)
+        ? JSON.stringify(body)
         : undefined,
     });
 
