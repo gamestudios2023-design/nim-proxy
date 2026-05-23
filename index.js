@@ -21,12 +21,29 @@ const MODEL_ROUTES = {
   'gemma':          'google/gemma-4-31b-it',
 };
 
+// Fake Anthropic models list — Claude Code validates against this
+const ANTHROPIC_MODELS = [
+  'claude-opus-4-7',
+  'claude-sonnet-4-6',
+  'claude-haiku-4-5-20251001',
+  'claude-opus-4-5',
+  'claude-sonnet-4-5',
+  'claude-3-5-sonnet-20241022',
+  'claude-3-5-haiku-20241022',
+  'claude-3-opus-20240229',
+].map(id => ({ type: 'model', id, display_name: id, created_at: '2024-01-01' }));
+
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'nim-proxy',
     routes: Object.entries(MODEL_ROUTES).map(([a, m]) => ({ alias: `/${a}/v1`, model: m })),
   });
+});
+
+// Return fake Anthropic models so Claude Code doesn't complain
+app.get(['/:alias/v1/models', '/v1/models'], (req, res) => {
+  res.json({ data: ANTHROPIC_MODELS });
 });
 
 // --- Format converters ---
