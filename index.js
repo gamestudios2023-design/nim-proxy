@@ -54,10 +54,17 @@ app.get(['/:alias/v1/models', '/v1/models'], (req, res) => {
 function anthropicToOpenAI(body, nimModel) {
   const messages = [];
   if (body.system) {
-    const sys = typeof body.system === 'string'
+    const raw = typeof body.system === 'string'
       ? body.system
       : body.system.map(b => b.text || '').join('');
-    messages.push({ role: 'system', content: sys });
+    // Retire seulement les blocs qui font boucler les skills (superpowers meta-instructions)
+    const sys = raw
+      .replace(/You have superpowers[\s\S]*?<\/EXTREMELY_IMPORTANT>/g, '')
+      .replace(/IF A SKILL APPLIES[\s\S]*?This is not negotiable[^\n]*/g, '')
+      .replace(/The following skills are available for use[\s\S]*?(?=\n#|\n\n#|$)/gm, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+    messages.push({ role: 'system', content: sys || 'You are a helpful AI assistant.' });
   }
   for (const msg of (body.messages || [])) {
     if (typeof msg.content === 'string') {
