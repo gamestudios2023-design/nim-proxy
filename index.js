@@ -304,32 +304,30 @@ async function streamOpenAIToAnthropic(nimRes, res, model, msgId) {
 // --- Main handler ---
 
 app.all(['/:alias/v1/*', '/v1/*'], async (req, res) => {
+  const alias = req.params.alias || 'default';
+  const model = alias !== 'default' ? (MODEL_ROUTES[alias] || alias) : 'meta/llama-3.3-70b-instruct';
+  const fullPath = req.path;
+  const v1Index = fullPath.indexOf('/v1');
+  const nimPath = fullPath.slice(v1Index + 3);
+  console.log(`[${new Date().toISOString()}] ${req.method} /${alias}/v1${nimPath} → ${model}`);
+
   const secret = process.env.PROXY_SECRET;
   const isClaudeCode = req.headers['anthropic-version'] != null;
   if (secret && !isClaudeCode && req.headers['x-proxy-secret'] !== secret) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  const alias = req.params.alias;
-  const modelOverride = alias ? MODEL_ROUTES[alias] : null;
-
-  const fullPath = req.path;
-  const v1Index = fullPath.indexOf('/v1');
-  const nimPath = fullPath.slice(v1Index + 3); // e.g. /messages or /chat/completions
-
   const isAnthropicMessages = nimPath === '/messages';
 
   let nimUrl, nimBody;
 
   if (isAnthropicMessages) {
-    // Claude Code → Anthropic format → translate to OpenAI
     nimUrl = `${NIM_BASE}/chat/completions`;
-    nimBody = anthropicToOpenAI(req.body, modelOverride || 'meta/llama-3.3-70b-instruct');
+    nimBody = anthropicToOpenAI(req.body, model);
   } else {
-    // Direct OpenAI-style call (tests, etc.)
     nimUrl = `${NIM_BASE}${nimPath}`;
     nimBody = { ...req.body };
-    if (modelOverride) nimBody.model = modelOverride;
+    if (alias !== 'default') nimBody.model = model;
   }
 
   try {
