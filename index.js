@@ -57,10 +57,38 @@ function anthropicToOpenAI(body, modelOverride) {
     messages.push({ role: 'system', content: sys });
   }
   for (const msg of (body.messages || [])) {
-    const content = typeof msg.content === 'string'
-      ? msg.content
-      : (msg.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
-    messages.push({ role: msg.role, content });
+    if (typeof msg.content === 'string') {
+      messages.push({ role: msg.role, content: msg.content });
+      continue;
+    }
+    const blocks = msg.content || [];
+    const textParts = [];
+    const toolCalls = [];
+    for (const b of blocks) {
+      if (b.type === 'text') textParts.push(b.text);
+      else if (b.type === 'tool_use') {
+        toolCalls.push({
+          id: b.id,
+          type: 'function',
+          function: { name: b.name, arguments: JSON.stringify(b.input || {}) },
+        });
+      } else if (b.type === 'tool_result') {
+        // Emit a separate tool role message
+        const resultContent = typeof b.content === 'string'
+          ? b.content
+          : (b.content || []).map(c => c.text || JSON.stringify(c)).join('\n');
+        messages.push({
+          role: 'tool',
+          tool_call_id: b.tool_use_id,
+          content: resultContent,
+        });
+      }
+    }
+    if (textParts.length || toolCalls.length) {
+      const m = { role: msg.role, content: textParts.join('') || null };
+      if (toolCalls.length) m.tool_calls = toolCalls;
+      messages.push(m);
+    }
   }
   const oai = {
     model: modelOverride,
@@ -70,18 +98,55 @@ function anthropicToOpenAI(body, modelOverride) {
   };
   if (body.temperature != null) oai.temperature = body.temperature;
   if (body.top_p != null) oai.top_p = body.top_p;
+  if (body.tools && body.tools.length) {
+    oai.tools = body.tools.map(t => ({
+      type: 'function',
+      function: {
+        name: t.name,
+        description: t.description,
+        parameters: t.input_schema,
+      },
+    }));
+    if (body.tool_choice) {
+      if (body.tool_choice.type === 'auto') oai.tool_choice = 'auto';
+      else if (body.tool_choice.type === 'any') oai.tool_choice = 'required';
+      else if (body.tool_choice.type === 'tool') {
+        oai.tool_choice = { type: 'function', function: { name: body.tool_choice.name } };
+      }
+    }
+  }
   return oai;
 }
 
 function openAIToAnthropic(oaiRes, model) {
   const choice = oaiRes.choices?.[0] || {};
+  const msg = choice.message || {};
+  const content = [];
+  if (msg.content) content.push({ type: 'text', text: msg.content });
+  if (msg.tool_calls) {
+    for (const tc of msg.tool_calls) {
+      let input = {};
+      try { input = JSON.parse(tc.function.arguments || '{}'); } catch {}
+      content.push({
+        type: 'tool_use',
+        id: tc.id,
+        name: tc.function.name,
+        input,
+      });
+    }
+  }
+  if (!content.length) content.push({ type: 'text', text: '' });
+  const stopReason = choice.finish_reason === 'tool_calls' ? 'tool_use'
+    : choice.finish_reason === 'stop' ? 'end_turn'
+    : choice.finish_reason === 'length' ? 'max_tokens'
+    : (choice.finish_reason || 'end_turn');
   return {
     id: oaiRes.id || `msg_${Date.now()}`,
     type: 'message',
     role: 'assistant',
-    content: [{ type: 'text', text: choice.message?.content || '' }],
+    content,
     model,
-    stop_reason: choice.finish_reason === 'stop' ? 'end_turn' : (choice.finish_reason || 'end_turn'),
+    stop_reason: stopReason,
     stop_sequence: null,
     usage: {
       input_tokens: oaiRes.usage?.prompt_tokens || 0,
