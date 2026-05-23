@@ -330,6 +330,9 @@ app.all(['/:alias/v1/*', '/v1/*'], async (req, res) => {
     if (alias !== 'default') nimBody.model = model;
   }
 
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 120000);
+
   try {
     const nimRes = await fetch(nimUrl, {
       method: req.method,
@@ -339,15 +342,16 @@ app.all(['/:alias/v1/*', '/v1/*'], async (req, res) => {
         'Accept': req.headers['accept'] || 'application/json',
       },
       body: ['POST', 'PUT', 'PATCH'].includes(req.method) ? JSON.stringify(nimBody) : undefined,
+      signal: controller.signal,
     });
+    clearTimeout(timeout);
 
     if (isAnthropicMessages && nimBody.stream) {
-      await streamOpenAIToAnthropic(nimRes, res, modelOverride || nimBody.model, `msg_${Date.now()}`);
+      await streamOpenAIToAnthropic(nimRes, res, model, `msg_${Date.now()}`);
     } else if (isAnthropicMessages) {
       const oaiData = await nimRes.json();
-      res.status(nimRes.status).json(openAIToAnthropic(oaiData, modelOverride || nimBody.model));
+      res.status(nimRes.status).json(openAIToAnthropic(oaiData, model));
     } else {
-      // Pass-through for /chat/completions, /models, etc.
       res.status(nimRes.status);
       nimRes.headers.forEach((v, k) => {
         if (!['content-encoding', 'transfer-encoding', 'connection'].includes(k)) res.setHeader(k, v);
@@ -356,6 +360,7 @@ app.all(['/:alias/v1/*', '/v1/*'], async (req, res) => {
       nimRes.body.pipe(res);
     }
   } catch (err) {
+    clearTimeout(timeout);
     console.error('Proxy error:', err.message);
     res.status(500).json({ error: err.message });
   }
