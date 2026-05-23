@@ -1,10 +1,14 @@
 const express = require('express');
 const fetch = require('node-fetch');
+const https = require('https');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
 const NIM_BASE = 'https://integrate.api.nvidia.com/v1';
+
+// Keep-alive agent — réutilise les connexions TLS vers NIM au lieu d'en créer une nouvelle à chaque requête
+const nimAgent = new https.Agent({ keepAlive: true, maxSockets: 10 });
 
 const MODEL_ROUTES = {
   'kimi':           'moonshotai/kimi-k2.6',
@@ -50,18 +54,9 @@ app.get(['/:alias/v1/models', '/v1/models'], (req, res) => {
 function anthropicToOpenAI(body, nimModel) {
   const messages = [];
   if (body.system) {
-    const raw = typeof body.system === 'string'
+    const sys = typeof body.system === 'string'
       ? body.system
       : body.system.map(b => b.text || '').join('');
-    // Strip Claude Code's meta-instructions (skills, superpowers, session context)
-    // Keep only actual user-facing system content
-    const stripped = raw
-      .replace(/You have superpowers[\s\S]*?<\/EXTREMELY_IMPORTANT>/g, '')
-      .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
-      .replace(/The following skills are available[\s\S]*?(?=\n\n|\n#|$)/g, '')
-      .replace(/SessionStart hook[\s\S]*?(?=\n\n|\n#|$)/g, '')
-      .trim();
-    const sys = stripped || 'You are a helpful AI assistant.';
     messages.push({ role: 'system', content: sys });
   }
   for (const msg of (body.messages || [])) {
@@ -320,6 +315,7 @@ app.all(['/:alias/v1/*', '/v1/*'], async (req, res) => {
         'Content-Type': 'application/json',
         'Accept': req.headers['accept'] || 'application/json',
       },
+      agent: nimAgent,
       body: ['POST', 'PUT', 'PATCH'].includes(req.method) ? JSON.stringify(nimBody) : undefined,
       signal: controller.signal,
     });
