@@ -155,17 +155,54 @@ function openAIToAnthropic(oaiRes, model) {
   };
 }
 
-// Stream: pipe OpenAI SSE → Anthropic SSE
+// Stream: pipe OpenAI SSE → Anthropic SSE (handles text + tool_calls)
 async function streamOpenAIToAnthropic(nimRes, res, model, msgId) {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('X-Accel-Buffering', 'no');
 
-  let started = false;
+  let messageStarted = false;
+  let textBlockStarted = false;
+  let textBlockClosed = false;
   let outputTokens = 0;
+  let finalStopReason = 'end_turn';
   let buf = '';
+  const toolBlocks = {}; // tcIndex → { anthropicIndex, started, closed, id, name }
+  let nextAnthropicIndex = 0;
 
   const write = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+
+  const startMessage = (id) => {
+    if (messageStarted) return;
+    messageStarted = true;
+    write('message_start', {
+      type: 'message_start',
+      message: {
+        id: id || msgId,
+        type: 'message', role: 'assistant', content: [], model,
+        stop_reason: null, stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+    });
+    res.write(`event: ping\ndata: {"type":"ping"}\n\n`);
+  };
+
+  const startTextBlock = () => {
+    if (textBlockStarted) return;
+    textBlockStarted = true;
+    write('content_block_start', {
+      type: 'content_block_start', index: 0,
+      content_block: { type: 'text', text: '' },
+    });
+    nextAnthropicIndex = Math.max(nextAnthropicIndex, 1);
+  };
+
+  const closeTextBlock = () => {
+    if (textBlockStarted && !textBlockClosed) {
+      textBlockClosed = true;
+      write('content_block_stop', { type: 'content_block_stop', index: 0 });
+    }
+  };
 
   nimRes.body.on('data', chunk => {
     buf += chunk.toString();
@@ -176,43 +213,83 @@ async function streamOpenAIToAnthropic(nimRes, res, model, msgId) {
       if (!line.startsWith('data: ')) continue;
       const raw = line.slice(6).trim();
       if (raw === '[DONE]') {
-        res.write(`event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n`);
+        closeTextBlock();
+        for (const tk of Object.keys(toolBlocks)) {
+          const tb = toolBlocks[tk];
+          if (tb.started && !tb.closed) {
+            tb.closed = true;
+            write('content_block_stop', { type: 'content_block_stop', index: tb.anthropicIndex });
+          }
+        }
         write('message_delta', {
           type: 'message_delta',
-          delta: { stop_reason: 'end_turn', stop_sequence: null },
+          delta: { stop_reason: finalStopReason, stop_sequence: null },
           usage: { output_tokens: outputTokens },
         });
         res.write(`event: message_stop\ndata: {"type":"message_stop"}\n\n`);
         return;
       }
-      let chunk_data;
-      try { chunk_data = JSON.parse(raw); } catch { continue; }
+      let cd;
+      try { cd = JSON.parse(raw); } catch { continue; }
+      startMessage(cd.id);
 
-      if (!started) {
-        started = true;
-        write('message_start', {
-          type: 'message_start',
-          message: {
-            id: chunk_data.id || msgId,
-            type: 'message', role: 'assistant', content: [], model,
-            stop_reason: null, stop_sequence: null,
-            usage: { input_tokens: 0, output_tokens: 0 },
-          },
-        });
-        write('content_block_start', {
-          type: 'content_block_start', index: 0,
-          content_block: { type: 'text', text: '' },
-        });
-        res.write(`event: ping\ndata: {"type":"ping"}\n\n`);
-      }
+      const choice = cd.choices?.[0] || {};
+      const delta = choice.delta || {};
 
-      const text = chunk_data.choices?.[0]?.delta?.content;
-      if (text) {
+      // Text content
+      if (delta.content) {
+        startTextBlock();
         outputTokens++;
         write('content_block_delta', {
           type: 'content_block_delta', index: 0,
-          delta: { type: 'text_delta', text },
+          delta: { type: 'text_delta', text: delta.content },
         });
+      }
+
+      // Tool calls
+      if (delta.tool_calls) {
+        for (const tc of delta.tool_calls) {
+          const tcIdx = tc.index ?? 0;
+          let tb = toolBlocks[tcIdx];
+          if (!tb) {
+            // Need to close text block before starting tool block
+            closeTextBlock();
+            tb = toolBlocks[tcIdx] = {
+              anthropicIndex: nextAnthropicIndex++,
+              started: false, closed: false,
+              id: tc.id || `toolu_${Date.now()}_${tcIdx}`,
+              name: tc.function?.name || '',
+            };
+          }
+          if (tc.function?.name) tb.name = tc.function.name;
+          if (tc.id) tb.id = tc.id;
+
+          if (!tb.started && tb.name) {
+            tb.started = true;
+            write('content_block_start', {
+              type: 'content_block_start',
+              index: tb.anthropicIndex,
+              content_block: { type: 'tool_use', id: tb.id, name: tb.name, input: {} },
+            });
+          }
+
+          const args = tc.function?.arguments;
+          if (args && tb.started) {
+            write('content_block_delta', {
+              type: 'content_block_delta',
+              index: tb.anthropicIndex,
+              delta: { type: 'input_json_delta', partial_json: args },
+            });
+          }
+        }
+      }
+
+      // Track finish reason
+      if (choice.finish_reason) {
+        finalStopReason = choice.finish_reason === 'tool_calls' ? 'tool_use'
+          : choice.finish_reason === 'stop' ? 'end_turn'
+          : choice.finish_reason === 'length' ? 'max_tokens'
+          : 'end_turn';
       }
     }
   });
