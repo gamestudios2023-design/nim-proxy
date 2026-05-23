@@ -21,7 +21,6 @@ const MODEL_ROUTES = {
   'gemma':          'google/gemma-4-31b-it',
 };
 
-// Fake Anthropic models list — Claude Code validates against this
 const ANTHROPIC_MODELS = [
   'claude-opus-4-7',
   'claude-sonnet-4-6',
@@ -37,18 +36,18 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'nim-proxy',
+    version: '4',
     routes: Object.entries(MODEL_ROUTES).map(([a, m]) => ({ alias: `/${a}/v1`, model: m })),
   });
 });
 
-// Return fake Anthropic models so Claude Code doesn't complain
 app.get(['/:alias/v1/models', '/v1/models'], (req, res) => {
   res.json({ data: ANTHROPIC_MODELS });
 });
 
-// --- Format converters ---
+// --- Anthropic → OpenAI converter ---
 
-function anthropicToOpenAI(body, modelOverride) {
+function anthropicToOpenAI(body, nimModel) {
   const messages = [];
   if (body.system) {
     const sys = typeof body.system === 'string'
@@ -65,23 +64,19 @@ function anthropicToOpenAI(body, modelOverride) {
     const textParts = [];
     const toolCalls = [];
     for (const b of blocks) {
-      if (b.type === 'text') textParts.push(b.text);
-      else if (b.type === 'tool_use') {
+      if (b.type === 'text') {
+        textParts.push(b.text);
+      } else if (b.type === 'tool_use') {
         toolCalls.push({
           id: b.id,
           type: 'function',
           function: { name: b.name, arguments: JSON.stringify(b.input || {}) },
         });
       } else if (b.type === 'tool_result') {
-        // Emit a separate tool role message
         const resultContent = typeof b.content === 'string'
           ? b.content
           : (b.content || []).map(c => c.text || JSON.stringify(c)).join('\n');
-        messages.push({
-          role: 'tool',
-          tool_call_id: b.tool_use_id,
-          content: resultContent,
-        });
+        messages.push({ role: 'tool', tool_call_id: b.tool_use_id, content: resultContent });
       }
     }
     if (textParts.length || toolCalls.length) {
@@ -91,7 +86,7 @@ function anthropicToOpenAI(body, modelOverride) {
     }
   }
   const oai = {
-    model: modelOverride,
+    model: nimModel,
     messages,
     max_tokens: body.max_tokens || 1024,
     stream: body.stream || false,
@@ -101,11 +96,7 @@ function anthropicToOpenAI(body, modelOverride) {
   if (body.tools && body.tools.length) {
     oai.tools = body.tools.map(t => ({
       type: 'function',
-      function: {
-        name: t.name,
-        description: t.description,
-        parameters: t.input_schema,
-      },
+      function: { name: t.name, description: t.description, parameters: t.input_schema },
     }));
     if (body.tool_choice) {
       if (body.tool_choice.type === 'auto') oai.tool_choice = 'auto';
@@ -118,7 +109,9 @@ function anthropicToOpenAI(body, modelOverride) {
   return oai;
 }
 
-function openAIToAnthropic(oaiRes, model) {
+// --- OpenAI → Anthropic converter (non-streaming) ---
+
+function openAIToAnthropic(oaiRes, nimModel) {
   const choice = oaiRes.choices?.[0] || {};
   const msg = choice.message || {};
   const content = [];
@@ -127,25 +120,20 @@ function openAIToAnthropic(oaiRes, model) {
     for (const tc of msg.tool_calls) {
       let input = {};
       try { input = JSON.parse(tc.function.arguments || '{}'); } catch {}
-      content.push({
-        type: 'tool_use',
-        id: tc.id,
-        name: tc.function.name,
-        input,
-      });
+      content.push({ type: 'tool_use', id: tc.id, name: tc.function.name, input });
     }
   }
   if (!content.length) content.push({ type: 'text', text: '' });
   const stopReason = choice.finish_reason === 'tool_calls' ? 'tool_use'
     : choice.finish_reason === 'stop' ? 'end_turn'
     : choice.finish_reason === 'length' ? 'max_tokens'
-    : (choice.finish_reason || 'end_turn');
+    : 'end_turn';
   return {
     id: oaiRes.id || `msg_${Date.now()}`,
     type: 'message',
     role: 'assistant',
     content,
-    model,
+    model: nimModel,
     stop_reason: stopReason,
     stop_sequence: null,
     usage: {
@@ -155,8 +143,9 @@ function openAIToAnthropic(oaiRes, model) {
   };
 }
 
-// Stream: pipe OpenAI SSE → Anthropic SSE (handles text + tool_calls)
-async function streamOpenAIToAnthropic(nimRes, res, model, msgId) {
+// --- OpenAI → Anthropic streaming converter ---
+
+async function streamOpenAIToAnthropic(nimRes, res, nimModel, msgId) {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('X-Accel-Buffering', 'no');
@@ -167,8 +156,8 @@ async function streamOpenAIToAnthropic(nimRes, res, model, msgId) {
   let outputTokens = 0;
   let finalStopReason = 'end_turn';
   let buf = '';
-  const toolBlocks = {}; // tcIndex → { anthropicIndex, started, closed, id, name }
-  let nextAnthropicIndex = 0;
+  const toolBlocks = {};
+  let nextAnthropicIndex = 1;
 
   const write = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 
@@ -178,8 +167,7 @@ async function streamOpenAIToAnthropic(nimRes, res, model, msgId) {
     write('message_start', {
       type: 'message_start',
       message: {
-        id: id || msgId,
-        type: 'message', role: 'assistant', content: [], model,
+        id: id || msgId, type: 'message', role: 'assistant', content: [], model: nimModel,
         stop_reason: null, stop_sequence: null,
         usage: { input_tokens: 0, output_tokens: 0 },
       },
@@ -190,11 +178,7 @@ async function streamOpenAIToAnthropic(nimRes, res, model, msgId) {
   const startTextBlock = () => {
     if (textBlockStarted) return;
     textBlockStarted = true;
-    write('content_block_start', {
-      type: 'content_block_start', index: 0,
-      content_block: { type: 'text', text: '' },
-    });
-    nextAnthropicIndex = Math.max(nextAnthropicIndex, 1);
+    write('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
   };
 
   const closeTextBlock = () => {
@@ -214,8 +198,7 @@ async function streamOpenAIToAnthropic(nimRes, res, model, msgId) {
       const raw = line.slice(6).trim();
       if (raw === '[DONE]') {
         closeTextBlock();
-        for (const tk of Object.keys(toolBlocks)) {
-          const tb = toolBlocks[tk];
+        for (const tb of Object.values(toolBlocks)) {
           if (tb.started && !tb.closed) {
             tb.closed = true;
             write('content_block_stop', { type: 'content_block_stop', index: tb.anthropicIndex });
@@ -231,12 +214,11 @@ async function streamOpenAIToAnthropic(nimRes, res, model, msgId) {
       }
       let cd;
       try { cd = JSON.parse(raw); } catch { continue; }
-      startMessage(cd.id);
 
+      startMessage(cd.id);
       const choice = cd.choices?.[0] || {};
       const delta = choice.delta || {};
 
-      // Text content
       if (delta.content) {
         startTextBlock();
         outputTokens++;
@@ -246,13 +228,11 @@ async function streamOpenAIToAnthropic(nimRes, res, model, msgId) {
         });
       }
 
-      // Tool calls
       if (delta.tool_calls) {
         for (const tc of delta.tool_calls) {
           const tcIdx = tc.index ?? 0;
           let tb = toolBlocks[tcIdx];
           if (!tb) {
-            // Need to close text block before starting tool block
             closeTextBlock();
             tb = toolBlocks[tcIdx] = {
               anthropicIndex: nextAnthropicIndex++,
@@ -263,28 +243,23 @@ async function streamOpenAIToAnthropic(nimRes, res, model, msgId) {
           }
           if (tc.function?.name) tb.name = tc.function.name;
           if (tc.id) tb.id = tc.id;
-
           if (!tb.started && tb.name) {
             tb.started = true;
             write('content_block_start', {
-              type: 'content_block_start',
-              index: tb.anthropicIndex,
+              type: 'content_block_start', index: tb.anthropicIndex,
               content_block: { type: 'tool_use', id: tb.id, name: tb.name, input: {} },
             });
           }
-
           const args = tc.function?.arguments;
           if (args && tb.started) {
             write('content_block_delta', {
-              type: 'content_block_delta',
-              index: tb.anthropicIndex,
+              type: 'content_block_delta', index: tb.anthropicIndex,
               delta: { type: 'input_json_delta', partial_json: args },
             });
           }
         }
       }
 
-      // Track finish reason
       if (choice.finish_reason) {
         finalStopReason = choice.finish_reason === 'tool_calls' ? 'tool_use'
           : choice.finish_reason === 'stop' ? 'end_turn'
@@ -295,21 +270,18 @@ async function streamOpenAIToAnthropic(nimRes, res, model, msgId) {
   });
 
   nimRes.body.on('end', () => res.end());
-  nimRes.body.on('error', err => {
-    console.error('Stream error:', err.message);
-    res.end();
-  });
+  nimRes.body.on('error', err => { console.error('Stream error:', err.message); res.end(); });
 }
 
 // --- Main handler ---
 
 app.all(['/:alias/v1/*', '/v1/*'], async (req, res) => {
   const alias = req.params.alias || 'default';
-  const model = alias !== 'default' ? (MODEL_ROUTES[alias] || alias) : 'meta/llama-3.3-70b-instruct';
+  const nimModel = MODEL_ROUTES[alias] || 'meta/llama-3.3-70b-instruct';
   const fullPath = req.path;
   const v1Index = fullPath.indexOf('/v1');
   const nimPath = fullPath.slice(v1Index + 3);
-  console.log(`[${new Date().toISOString()}] ${req.method} /${alias}/v1${nimPath} → ${model}`);
+  console.log(`[${new Date().toISOString()}] ${req.method} /${alias}${nimPath} → ${nimModel}`);
 
   const secret = process.env.PROXY_SECRET;
   const isClaudeCode = req.headers['anthropic-version'] != null;
@@ -318,16 +290,14 @@ app.all(['/:alias/v1/*', '/v1/*'], async (req, res) => {
   }
 
   const isAnthropicMessages = nimPath === '/messages';
-
   let nimUrl, nimBody;
 
   if (isAnthropicMessages) {
     nimUrl = `${NIM_BASE}/chat/completions`;
-    nimBody = anthropicToOpenAI(req.body, model);
+    nimBody = anthropicToOpenAI(req.body, nimModel);
   } else {
     nimUrl = `${NIM_BASE}${nimPath}`;
-    nimBody = { ...req.body };
-    if (alias !== 'default') nimBody.model = model;
+    nimBody = { ...req.body, model: nimModel };
   }
 
   const controller = new AbortController();
@@ -347,10 +317,10 @@ app.all(['/:alias/v1/*', '/v1/*'], async (req, res) => {
     clearTimeout(timeout);
 
     if (isAnthropicMessages && nimBody.stream) {
-      await streamOpenAIToAnthropic(nimRes, res, model, `msg_${Date.now()}`);
+      await streamOpenAIToAnthropic(nimRes, res, nimModel, `msg_${Date.now()}`);
     } else if (isAnthropicMessages) {
       const oaiData = await nimRes.json();
-      res.status(nimRes.status).json(openAIToAnthropic(oaiData, model));
+      res.status(nimRes.status).json(openAIToAnthropic(oaiData, nimModel));
     } else {
       res.status(nimRes.status);
       nimRes.headers.forEach((v, k) => {
