@@ -146,7 +146,8 @@ async function streamOpenAIToAnthropic(nimRes, res, model, msgId) {
 
 app.all(['/:alias/v1/*', '/v1/*'], async (req, res) => {
   const secret = process.env.PROXY_SECRET;
-  if (secret && req.headers['x-proxy-secret'] !== secret) {
+  const isClaudeCode = req.headers['anthropic-version'] != null;
+  if (secret && !isClaudeCode && req.headers['x-proxy-secret'] !== secret) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
